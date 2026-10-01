@@ -1,0 +1,9 @@
+azure-ai-projects
+azure-identity
+openai
+pydantic>=2
+python-dotenv
+numpy
+onnxruntime
+transformers
+huggingface-hub
