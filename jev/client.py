@@ -5,8 +5,9 @@ probabilities. This reproduces that interface on top of an LLM by compiling the
 questions into a strict JSON Schema, so the model is structurally unable to emit
 an option that was not declared up front.
 
-Note: the probabilities an LLM returns here are numbers it *wrote*, not a
-softmax over model outputs. See `jev.encoders` for the real thing.
+Note: the probabilities an LLM returns here are numbers it *wrote*, not a softmax
+over model outputs. Treat them as a heuristic; see `jev.encoders` for scores that
+come from the model's actual output distribution.
 
 The deployed gpt-6 snapshots reject json_schema on the Responses API, so this
 uses Chat Completions.
@@ -23,8 +24,12 @@ from pydantic import TypeAdapter
 from .primitives import (
     Answer,
     Choice,
+    ChoiceAnswer,
+    Noul,
+    NoulAnswer,
     Question,
     Score,
+    ScoreAnswer,
     SystemOneResponse,
     Usage,
 )
@@ -51,32 +56,36 @@ def _distribution_schema(labels: tuple[str, ...]) -> dict[str, Any]:
     }
 
 
-def _question_schema(question: Question) -> dict[str, Any]:
+def _question_schema(question: Question, include_probabilities: bool = True) -> dict[str, Any]:
     if isinstance(question, Choice):
+        properties: dict[str, Any] = {
+            "kind": {"type": "string", "enum": ["choice"]},
+            "choice": {"type": "string", "enum": list(question.options)},
+        }
+        if include_probabilities:
+            properties["probabilities"] = _distribution_schema(question.options)
+        properties["confidence"] = {"type": "number"}
         return {
             "type": "object",
             "description": question.instructions,
-            "properties": {
-                "kind": {"type": "string", "enum": ["choice"]},
-                "choice": {"type": "string", "enum": list(question.options)},
-                "probabilities": _distribution_schema(question.options),
-                "confidence": {"type": "number"},
-            },
-            "required": ["kind", "choice", "probabilities", "confidence"],
+            "properties": properties,
+            "required": list(properties),
             "additionalProperties": False,
         }
 
     if isinstance(question, Score):
+        properties = {
+            "kind": {"type": "string", "enum": ["score"]},
+            "score": {"type": "string", "enum": list(question.rubric)},
+        }
+        if include_probabilities:
+            properties["probabilities"] = _distribution_schema(question.rubric)
+        properties["confidence"] = {"type": "number"}
         return {
             "type": "object",
             "description": question.instructions,
-            "properties": {
-                "kind": {"type": "string", "enum": ["score"]},
-                "score": {"type": "string", "enum": list(question.rubric)},
-                "probabilities": _distribution_schema(question.rubric),
-                "confidence": {"type": "number"},
-            },
-            "required": ["kind", "score", "probabilities", "confidence"],
+            "properties": properties,
+            "required": list(properties),
             "additionalProperties": False,
         }
 
@@ -92,11 +101,22 @@ def _question_schema(question: Question) -> dict[str, Any]:
     }
 
 
-def build_schema(questions: Mapping[str, Question]) -> dict[str, Any]:
-    """Compile typed questions into one strict JSON Schema."""
+def build_schema(
+    questions: Mapping[str, Question], include_probabilities: bool = True
+) -> dict[str, Any]:
+    """Compile typed questions into one strict JSON Schema.
+
+    With `include_probabilities=False` the per-option distribution is dropped.
+    A full distribution requires one required key per option, which at high
+    cardinality makes the schema large and the model's output long; Jev itself
+    switches strategy past 255 options for the same reason.
+    """
     return {
         "type": "object",
-        "properties": {name: _question_schema(q) for name, q in questions.items()},
+        "properties": {
+            name: _question_schema(q, include_probabilities)
+            for name, q in questions.items()
+        },
         "required": list(questions),
         "additionalProperties": False,
     }
@@ -119,12 +139,48 @@ def _describe(questions: Mapping[str, Question]) -> str:
 class JevClient:
     """System One evaluation backed by an LLM deployment."""
 
-    def __init__(self, client: Any, model: str = "gpt-6-luna", cache: bool = True) -> None:
+    def __init__(
+        self,
+        client: Any,
+        model: str = "gpt-6-luna",
+        cache: bool = True,
+        include_probabilities: bool = True,
+    ) -> None:
         self._client = client
         self._model = model
         self._cache: dict[str, SystemOneResponse] | None = {} if cache else None
+        self._include_probabilities = include_probabilities
         self.calls = 0
         self.cache_hits = 0
+
+    def _fill_distribution(
+        self, payload: dict[str, Any], questions: Mapping[str, Question]
+    ) -> dict[str, Any]:
+        """Rebuild a distribution the model was not asked to emit.
+
+        Keeps ChoiceAnswer/ScoreAnswer total, spreading the remaining mass
+        evenly. The winner's probability is the model's own confidence, so
+        downstream routing still works -- it is just coarser.
+        """
+        for name, question in questions.items():
+            answer = payload.get(name)
+            if not isinstance(answer, dict) or "probabilities" in answer:
+                continue
+
+            if isinstance(question, Choice):
+                labels, picked = question.options, answer.get("choice")
+            elif isinstance(question, Score):
+                labels, picked = question.rubric, answer.get("score")
+            else:
+                continue
+
+            confidence = float(answer.get("confidence", 1.0))
+            confidence = min(1.0, max(0.0, confidence))
+            remainder = (1.0 - confidence) / max(1, len(labels) - 1)
+            answer["probabilities"] = {
+                label: (confidence if label == picked else remainder) for label in labels
+            }
+        return payload
 
     def system_one(
         self,
@@ -134,7 +190,7 @@ class JevClient:
         if not questions:
             raise ValueError("At least one question is required")
 
-        schema = build_schema(questions)
+        schema = build_schema(questions, self._include_probabilities)
         cache_key = json.dumps(
             {"state": state, "model": self._model, "schema": schema}, sort_keys=True
         )
@@ -168,6 +224,8 @@ class JevClient:
         self.calls += 1
 
         payload = json.loads(completion.choices[0].message.content)
+        if not self._include_probabilities:
+            payload = self._fill_distribution(payload, questions)
         answers = {name: _answer_adapter.validate_python(value) for name, value in payload.items()}
 
         usage = completion.usage

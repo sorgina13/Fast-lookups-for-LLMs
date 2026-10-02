@@ -2,9 +2,12 @@
 
 from .client import JevClient, build_schema
 from .encoders import (
+    CrossEncoderChoiceClassifier,
     EncoderChoiceClassifier,
     FoundryEncoder,
+    LateInteractionChoiceClassifier,
     LocalBertEncoder,
+    LocalCrossEncoder,
 )
 from .primitives import (
     Choice,
@@ -22,8 +25,11 @@ __all__ = [
     "JevClient",
     "build_schema",
     "EncoderChoiceClassifier",
+    "CrossEncoderChoiceClassifier",
+    "LateInteractionChoiceClassifier",
     "FoundryEncoder",
     "LocalBertEncoder",
+    "LocalCrossEncoder",
     "Choice",
     "ChoiceAnswer",
     "Noul",
